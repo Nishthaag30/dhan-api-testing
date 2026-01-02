@@ -429,10 +429,14 @@ export function closeSocket() {
 }
 
 // =====================
-// Auto-init (Server only)
+// Auto-init (Server only, skip during build)
 // =====================
 if (typeof window === 'undefined') {
-  if (!global.__dhanSocketStarted) {
+  // Don't initialize during build/static generation
+  // NEXT_PHASE is set during build, VERCEL_ENV is set during runtime on Vercel
+  const isBuildTime = process.env.NEXT_PHASE === 'phase-production-build';
+  
+  if (!isBuildTime && !global.__dhanSocketStarted) {
     global.__dhanSocketStarted = true;
     initDhanSocket();
   }

@@ -2,7 +2,12 @@ import { subscribeToTicks } from '@/lib/dhanSocket';
 
 /**
  * Server-Sent Events (SSE) endpoint for streaming tick data to frontend
+ * 
+ * This route must be dynamic - it cannot be statically generated
  */
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+
 export async function GET() {
   const encoder = new TextEncoder();
   let heartbeatInterval: NodeJS.Timeout | null = null;
