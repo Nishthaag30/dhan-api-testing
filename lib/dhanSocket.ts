@@ -35,6 +35,76 @@ let isConnecting = false;
 let reconnectDelay = 5000;
 
 // =====================
+// Tick Data Store (for frontend)
+// =====================
+export interface TickData {
+  securityId: number;
+  symbol: string;
+  price: number;
+  timestamp: number;
+  messageType: number;
+  messageTypeLabel: string;
+}
+
+// Store latest tick data per security ID
+const tickDataStore = new Map<number, TickData>();
+
+// SSE clients (for pushing data to frontend)
+interface SSEClient {
+  controller: ReadableStreamDefaultController;
+  id: string;
+}
+
+const sseClients = new Map<string, SSEClient>();
+
+export function getTickData(securityId?: number): TickData | Map<number, TickData> {
+  if (securityId) {
+    return tickDataStore.get(securityId)!;
+  }
+  return tickDataStore;
+}
+
+export function subscribeToTicks(controller: ReadableStreamDefaultController): () => void {
+  const id = Math.random().toString(36).substring(7);
+  sseClients.set(id, { controller, id });
+
+  // Send initial data
+  const initialData = Array.from(tickDataStore.values());
+  if (initialData.length > 0) {
+    try {
+      controller.enqueue(
+        new TextEncoder().encode(`data: ${JSON.stringify({ type: 'initial', data: initialData })}\n\n`)
+      );
+    } catch (error) {
+      console.error('[DhanSocket] Error sending initial data to SSE client:', error);
+    }
+  }
+
+  // Return unsubscribe function
+  return () => {
+    sseClients.delete(id);
+  };
+}
+
+function broadcastTickData(tickData: TickData) {
+  const message = `data: ${JSON.stringify({ type: 'tick', data: tickData })}\n\n`;
+  const encoded = new TextEncoder().encode(message);
+  
+  // Remove closed connections
+  const toRemove: string[] = [];
+  sseClients.forEach((client, id) => {
+    try {
+      client.controller.enqueue(encoded);
+    } catch (error) {
+      // Client disconnected
+      toRemove.push(id);
+    }
+  });
+  
+  toRemove.forEach((id) => sseClients.delete(id));
+}
+
+// =====================
 // Instrument Lookups (O(1))
 // =====================
 const SECURITY_ID_TO_SYMBOL = new Map<string, string>();
@@ -71,12 +141,15 @@ function isMarketOpen() {
   const now = new Date();
   const hours = now.getUTCHours() + 5; // IST offset
   const minutes = now.getUTCMinutes();
-  const totalMinutes = hours * 60 + minutes;
+  const istMinutes =
+  now.getUTCHours() * 60 +
+  now.getUTCMinutes() +
+  330;
 
   const marketOpen = 9 * 60 + 15;  // 09:15 IST
   const marketClose = 15 * 60 + 30; // 15:30 IST
 
-  return totalMinutes >= marketOpen && totalMinutes <= marketClose;
+  return istMinutes >= marketOpen && istMinutes <= marketClose;
 }
 
 
@@ -96,19 +169,35 @@ function subscribeToStockCodes() {
 
   validateInstruments();
 
-  const payload = {
-    RequestCode: 21, // Market Feed Subscribe
-    InstrumentCount: STOCK_INSTRUMENTS.length,
-    InstrumentList: STOCK_INSTRUMENTS.map(inst => ({
-      ExchangeSegment: inst.exchange,
-      SecurityId: inst.securityId,
-    })),
-  };
+  // Batch subscriptions - Dhan API may have limits on subscription size
+  // RequestCode 15 is the correct code for market feed subscription
+  const BATCH_SIZE = 100; // Subscribe in batches to avoid API limits
+  
+  const totalInstruments = STOCK_INSTRUMENTS.length;
+  let subscribedCount = 0;
 
-  ws.send(JSON.stringify(payload));
+  for (let i = 0; i < totalInstruments; i += BATCH_SIZE) {
+    const batch = STOCK_INSTRUMENTS.slice(i, i + BATCH_SIZE);
+    
+    const payload = {
+      RequestCode: 15, // Market Feed Subscribe (correct code)
+      InstrumentCount: batch.length,
+      InstrumentList: batch.map(inst => ({
+        ExchangeSegment: inst.exchange,
+        SecurityId: inst.securityId,
+      })),
+    };
+
+    const subscriptionMsg = JSON.stringify(payload);
+    console.log(
+      `[DhanSocket] Sending subscription batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} instruments (${subscribedCount + batch.length}/${totalInstruments})`
+    );
+    ws.send(subscriptionMsg);
+    subscribedCount += batch.length;
+  }
 
   console.log(
-    `[DhanSocket] Subscribed to ${STOCK_INSTRUMENTS.length} instruments`
+    `[DhanSocket] Subscribed to ${totalInstruments} instruments in ${Math.ceil(totalInstruments / BATCH_SIZE)} batches`
   );
 
   const modePayload = {
@@ -116,7 +205,9 @@ function subscribeToStockCodes() {
     Mode: 1,         // LTP
   };
 
-  ws.send(JSON.stringify(modePayload));
+  const modeMsg = JSON.stringify(modePayload);
+  console.log('[DhanSocket] Sending mode payload:', modeMsg);
+  ws.send(modeMsg);
   console.log('[DhanSocket] LTP mode enabled');
 }
 
@@ -131,30 +222,98 @@ function resolveSymbol(securityId?: string): string {
   );
 }
 
-function handleMessage(data: WebSocket.Data) {
+function parseBinaryTick(buffer: Buffer): {
+  messageType: number;
+  securityId: number;
+  price: number;
+  timestamp: number;
+} | null {
+  if (buffer.length < 16) {
+    return null; // Invalid message length
+  }
+
   try {
-    console.log('handleMessage called');
-    console.log('data', data);
-    if (!Buffer.isBuffer(data)) return;
+    // Dhan binary tick format (LTP mode - 16 bytes):
+    // Byte 0: Feed Response Code (0x02 = LTP, 0x06 = Quote/OI)
+    // Bytes 1-2: Message Length (little-endian)
+    // Byte 3: Exchange Segment
+    // Bytes 4-7: Security ID (4 bytes, little-endian, unsigned int)
+    // Bytes 8-11: Last Traded Price (4 bytes, float, little-endian)
+    // Bytes 12-15: Last Traded Time (4 bytes, unsigned int, little-endian)
 
-    // Packet type
-    const packetType = data.readInt16LE(0);
+    const messageType = buffer.readUInt8(0);
+    // const messageLength = buffer.readUInt16LE(1);
+    // const exchangeSegment = buffer.readUInt8(3);
+    const securityId = buffer.readUInt32LE(4);
+    const price = buffer.readFloatLE(8);
+    const timestamp = buffer.readUInt32LE(12);
 
-    // 1 = LTP packet
-    if (packetType !== 1) return;
-
-    const securityId = data.readInt32LE(2).toString();
-    const ltp = data.readFloatLE(6);
-
-    const symbol =
-      SECURITY_ID_TO_SYMBOL.get(securityId) ??
-      `securityId:${securityId}`;
-
-    console.log(`[LTP] ${symbol} → ₹${ltp}`);
-  } catch (err) {
-    console.error('[DhanSocket] Tick parse error', err);
+    return {
+      messageType,
+      securityId,
+      price,
+      timestamp,
+    };
+  } catch (error) {
+    console.error('[DhanSocket] Error parsing binary tick:', error);
+    return null;
   }
 }
+
+function handleMessage(data: WebSocket.Data) {
+  try {
+    if (!Buffer.isBuffer(data)) {
+      console.log('[DhanSocket] [TEXT MESSAGE]', data.toString());
+      return;
+    }
+
+    // Parse binary tick data
+    const tickData = parseBinaryTick(data);
+    
+    if (!tickData) {
+      // If parsing fails, log raw hex for debugging
+      console.log(
+        '[DhanSocket] [BINARY TICK - UNPARSED]',
+        'length =',
+        data.length,
+        'hex =',
+        data.toString('hex').slice(0, 80)
+      );
+      return;
+    }
+
+    const { messageType, securityId, price, timestamp } = tickData;
+    const symbol = resolveSymbol(String(securityId));
+    
+    // Format timestamp (Unix timestamp in seconds)
+    const date = new Date(timestamp * 1000);
+    const timeStr = date.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+    // Message type labels
+    const messageTypeLabel = messageType === 0x02 ? 'LTP' : messageType === 0x06 ? 'QUOTE' : `TYPE_${messageType}`;
+
+    // Store tick data
+    const tickDataWithSymbol: TickData = {
+      securityId,
+      symbol,
+      price,
+      timestamp,
+      messageType,
+      messageTypeLabel,
+    };
+    tickDataStore.set(securityId, tickDataWithSymbol);
+
+    // Broadcast to SSE clients
+    broadcastTickData(tickDataWithSymbol);
+
+    console.log(
+      `[DhanSocket] [${messageTypeLabel}] ${symbol} (ID: ${securityId}) | Price: ₹${price.toFixed(2)} | Time: ${timeStr}`
+    );
+  } catch (error) {
+    console.error('[DhanSocket] Error in handleMessage:', error);
+  }
+}
+
 
 
 
@@ -184,12 +343,30 @@ function connectWebSocket() {
     reconnectDelay = 5000;
 
     console.log('[DhanSocket] Connected');
+    console.log('[DhanSocket] ReadyState:', ws?.readyState, '(OPEN =', WebSocket.OPEN, ')');
+    console.log('[DhanSocket] Message listeners:', ws?.listeners('message').length);
     subscribeToStockCodes();
   });
 
-  console.log('ws.onmessage', ws.onmessage);
-  console.log('Calling handleMessage');
+  // Log ping/pong for connection health
+  ws.on('ping', () => {
+    console.log('[DhanSocket] Received ping');
+  });
+
+  ws.on('pong', () => {
+    console.log('[DhanSocket] Received pong');
+  });
+
+  // Register message handler BEFORE 'open' to catch all messages
   ws.on('message', handleMessage);
+  console.log('[DhanSocket] Message handler registered, listeners:', ws.listeners('message').length);
+  
+  // Verify handler is attached
+  const listeners = ws.listeners('message');
+  console.log('[DhanSocket] Registered message handlers:', listeners.length);
+  if (listeners.length === 0) {
+    console.error('[DhanSocket] WARNING: No message handlers registered!');
+  }
 
   ws.on('error', err => {
     console.error('[DhanSocket] WebSocket error', err);
