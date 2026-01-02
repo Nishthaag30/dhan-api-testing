@@ -313,7 +313,7 @@ function handleMessage(data: WebSocket.Data) {
     });
 
     console.log(
-      `[DhanSocket] [${messageTypeLabel}] ${symbol} (ID: ${securityId}) | Price: ₹${price.toFixed(2)} | Time: ${timeStr}`
+      `[DhanSocket]    [${messageTypeLabel}] ${symbol} (ID: ${securityId}) | Price: ₹${price.toFixed(2)} | Time: ${timeStr}`
     );
   } catch (error) {
     console.error('[DhanSocket] Error in handleMessage:', error);
