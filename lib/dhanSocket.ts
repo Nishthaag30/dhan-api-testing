@@ -12,6 +12,7 @@ import {
   STOCK_INSTRUMENTS,
   type DhanInstrument,
 } from '../stockCodes';
+import { saveStockPrice } from './firebaseServer';
 
 // =====================
 // Constants & Env
@@ -305,6 +306,11 @@ function handleMessage(data: WebSocket.Data) {
 
     // Broadcast to SSE clients
     broadcastTickData(tickDataWithSymbol);
+
+    // Save to Firebase (async, non-blocking)
+    saveStockPrice(symbol, price, securityId, timestamp).catch((error) => {
+      // Error already logged in saveStockPrice, just prevent unhandled rejection
+    });
 
     console.log(
       `[DhanSocket] [${messageTypeLabel}] ${symbol} (ID: ${securityId}) | Price: ₹${price.toFixed(2)} | Time: ${timeStr}`
