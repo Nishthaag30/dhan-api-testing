@@ -6,8 +6,10 @@ let firestoreDb: FirebaseFirestore.Firestore | null = null;
 export function getFirestoreServer() {
   if (firestoreDb) return firestoreDb;
 
-  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_KEY
-  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY)
+  const base64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+
+const serviceAccount = base64
+  ? JSON.parse(Buffer.from(base64, 'base64').toString('utf8'))
   : null;
 
   if (!serviceAccount) {
